@@ -1,0 +1,200 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 04/08/2025 04:44:02 PM
+// Design Name: 
+// Module Name: Tutorial_Level
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module Tutorial_Level(
+    input clk_100MHz,
+    input rst,          // Use this for resetting game state
+    inout PS2Clk,
+    inout PS2Data,
+    output [7:0] JC     // Pmod connector for OLED
+);
+
+    //-------------------------------------------------------------------------
+    // Parameters
+    //-------------------------------------------------------------------------
+    localparam SCREEN_WIDTH = 96;
+    localparam SCREEN_HEIGHT = 64;
+    localparam PADDLE_WIDTH = 14;
+    localparam PADDLE_HEIGHT = 3; // Ensure this matches Paddle module internal logic if not parameterized
+    localparam BALL_SIZE = 3;     // Ensure this matches Ball module parameter
+    
+    // Mouse Parameters (kept from original)
+    localparam MOUSE_SENSITIVITY_DIVIDER = 16;
+    localparam SCALED_X_BOUNDARY = (SCREEN_WIDTH * MOUSE_SENSITIVITY_DIVIDER) - 1; // Max raw mouse value reported
+    
+    // Ball Update Rate Control (~60 Hz update rate)
+    // Period = 100MHz / 60Hz = 1,666,667 cycles
+    localparam BALL_UPDATE_PERIOD = 1666667;
+    // Bits needed for counter: ceil(log2(1666667)) = 20 bits
+    localparam BALL_COUNTER_BITS = 21;
+    
+    // Color Definitions (16-bit RGB565)
+    localparam PADDLE_COLOR = 16'hFFFF; // White
+    localparam BALL_COLOR   = 16'hF800; // Red
+    localparam BG_COLOR     = 16'h0000; // Black
+    
+    //-------------------------------------------------------------------------
+    // Wires & Regs
+    //-------------------------------------------------------------------------
+    
+    // --- Clocking ---
+    wire clk_6p25MHz; // For OLED
+    
+    // --- OLED Interface ---
+    wire [15:0] oled_data;      // Pixel data TO the OLED driver
+    wire [12:0] pixel_index;    // Current pixel index FROM the OLED driver
+    wire frame_begin;           // Signal FROM OLED driver
+    wire sending_pixels;        // Signal FROM OLED driver
+    wire sample_pixel;          // Signal FROM OLED driver
+    wire [6:0] pixel_x;         // Calculated current pixel X
+    wire [5:0] pixel_y;         // Calculated current pixel Y
+    
+    // --- Mouse Interface ---
+    wire left, middle, right;   // Button states FROM MouseCtl
+    wire [11:0] xpos;           // Raw X position FROM MouseCtl (0 to SCALED_X_BOUNDARY)
+    wire [11:0] ypos;           // Raw Y position FROM MouseCtl (unused here)
+    wire [3:0] zpos;            // Scroll wheel FROM MouseCtl (unused here)
+    wire new_event;             // New data flag FROM MouseCtl
+    
+    // --- Paddle Interface ---
+    wire paddle_pixel;          // Pixel is paddle? FROM Paddle
+    wire [6:0] paddle_x_pos;    // Paddle X position FROM Paddle
+    
+    // --- Ball Interface ---
+    wire ball_pixel;            // Pixel is ball? FROM Ball
+    wire ball_lost;             // Ball below screen? FROM Ball
+    reg [BALL_COUNTER_BITS-1:0] ball_update_counter = 0;
+    wire ball_update_enable;    // Single-cycle enable pulse for Ball module
+    
+    //-------------------------------------------------------------------------
+    // Clock Generation
+    //-------------------------------------------------------------------------
+    Clock_Divider (clk_100MHz, rst, 7, clk_6p25MHz);
+    
+    //-------------------------------------------------------------------------
+    // Pixel Coordinate Calculation
+    //-------------------------------------------------------------------------
+    // Translate linear pixel index from OLED driver to X, Y coordinates
+    assign pixel_x = pixel_index % SCREEN_WIDTH; // Remainder gives X
+    assign pixel_y = pixel_index / SCREEN_WIDTH; // Integer division gives Y
+    
+    //-------------------------------------------------------------------------
+    // Ball Update Enable Generator
+    //-------------------------------------------------------------------------
+    // Use this over 60Hz clock because this is synchronous with the 100MHz clk
+    // Creates a single-cycle pulse 'ball_update_enable' every BALL_UPDATE_PERIOD cycles
+    assign ball_update_enable = (ball_update_counter == BALL_UPDATE_PERIOD - 1);
+    
+    always @(posedge clk_100MHz) begin
+        if (rst || ball_lost) begin // Reset counter on system reset or when ball is lost
+            ball_update_counter <= 0;
+        end else begin
+            if (ball_update_enable) begin // Check if counter reached the end
+                ball_update_counter <= 0;
+            end else begin
+                ball_update_counter <= ball_update_counter + 1;
+            end
+        end
+    end
+    
+    //-------------------------------------------------------------------------
+    // Module Instantiations
+    //-------------------------------------------------------------------------
+    
+    // --- OLED Driver ---
+    Oled_Display oled_display(
+        .clk(clk_6p25MHz),      // Use divided clock
+        .reset(rst),
+        // --- Control/Status Signals ---
+        .frame_begin(frame_begin),     // Output: Start of frame
+        .sending_pixels(sending_pixels),// Output: Actively sending pixel data
+        .sample_pixel(sample_pixel),    // Output: Request for pixel data for 'pixel_index'
+        // --- Pixel Data ---
+        .pixel_index(pixel_index),      // Output: Linear index (0 to 6143) of current pixel
+        .pixel_data(oled_data),         // Input: 16-bit color data for the current pixel
+        // --- Physical Interface (Pmod JC) ---
+        .cs(JC[0]),             // Chip Select
+        .sdin(JC[1]),           // Data In (MOSI)
+        .sclk(JC[3]),           // Serial Clock
+        .d_cn(JC[4]),           // Data/Command
+        .resn(JC[5]),           // Reset
+        .vccen(JC[6]),          // VCC Enable
+        .pmoden(JC[7])          // PMOD Enable
+    );
+    
+    // --- PS/2 Mouse Controller ---
+     MouseCtl mouse_control (
+        .clk(clk_100MHz),
+        .rst(rst), // Connect system reset now
+         // Set initial mouse position/boundaries (only on config pulse if needed)
+        .value(SCALED_X_BOUNDARY), // Value used for setx/sety/setmax_x/y
+        .setx(1'b0), .sety(1'b0),   // Don't force position
+        .setmax_x(1'b1),           // Set the max X value mouse reports
+        .setmax_y(1'b0),           // Don't set max Y
+        // Outputs
+        .xpos(xpos), .ypos(ypos), .zpos(zpos),
+        .left(left), .right(right), .middle(middle),
+        .new_event(new_event),     // Flag indicates new xpos/button data is valid
+        // Bidirectional PS/2 Interface
+        .ps2_clk(PS2Clk),
+        .ps2_data(PS2Data)
+    );
+    
+    // --- Paddle Logic ---
+    Paddle #(
+        .PADDLE_WIDTH(PADDLE_WIDTH),
+        .PADDLE_HEIGHT(PADDLE_HEIGHT), // Pass relevant params
+        .SCREEN_WIDTH(SCREEN_WIDTH),
+        .SCREEN_HEIGHT(SCREEN_HEIGHT),
+        .MOUSE_SENSITIVITY_DIVIDER(MOUSE_SENSITIVITY_DIVIDER)
+    ) paddle_instance (
+        .clk(clk_100MHz),
+        .reset(rst),
+        .new_event(new_event),       // From MouseCtl
+        .x_position(xpos),           // Raw mouse X from MouseCtl
+        .current_pixel_y(pixel_y),   // Current scanline Y
+        .current_pixel_x(pixel_x),   // Current scanline X
+        .paddle_x_pos(paddle_x_pos), // Output: Paddle's logical X position
+        .paddle_pixel(paddle_pixel)  // Output: Should current pixel be paddle color?
+    );
+    
+    // --- Ball Logic & Physics ---
+    Ball ball_instance (
+        .clk_100MHz(clk_100MHz),
+        .rst(rst),
+        .paddle_x_pos(paddle_x_pos),        // From Paddle instance
+        .current_pixel_x(pixel_x),
+        .current_pixel_y(pixel_y),
+        .ball_pixel(ball_pixel),            // Output: Should current pixel be ball color?
+        .ball_lost(ball_lost)               // Output: Has ball gone off bottom?
+    );
+    
+    //-------------------------------------------------------------------------
+    // Pixel Color Multiplexing
+    //-------------------------------------------------------------------------
+    
+    // Determine final pixel color based on which object is present (priority: Ball > Paddle > Background)
+    assign oled_data = ball_pixel ? BALL_COLOR :      // If it's the ball, draw ball color
+                       paddle_pixel ? PADDLE_COLOR :  // Else if it's the paddle, draw paddle color
+                       BG_COLOR;                      // Otherwise, draw background color
+
+endmodule
